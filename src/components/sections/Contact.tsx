@@ -5,15 +5,62 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { services } from "@/content/services";
 import { site } from "@/content/site";
 import { getAttribution, track } from "@/lib/analytics";
+import { ALLOWED_EXT, MAX_PHOTOS, MAX_UPLOAD_MB, type UploadedFile } from "@/lib/uploads";
 import type { PrefillDetail } from "@/lib/events";
 import { SplitLines, Reveal } from "../ui/Reveal";
 
 export const BUSINESS_TYPES = ["Restaurant / café", "Bar / hospitality", "Retail store", "Hotel", "Office / corporate", "Property developer", "Gym / fitness", "Salon / barber", "Architect / interior designer", "Other"];
 export const BUDGETS = ["Under £2,500", "£2,500 – £5,000", "£5,000 – £10,000", "£10,000 – £25,000", "£25,000+", "Not sure yet"];
 const TIMELINES = ["As soon as possible", "Within 1 month", "1–3 months", "3–6 months", "Just planning"];
-const MAX_FILE_MB = 10;
+type Status = "idle" | "uploading" | "sending" | "done" | "error";
 
-type Status = "idle" | "sending" | "done" | "error";
+const safeName = (n: string) => n.normalize("NFKD").replace(/[^\w.-]+/g, "-").replace(/-+/g, "-").slice(-80);
+
+/**
+ * Uploads files straight from the browser to Vercel Blob (see /api/upload), so
+ * large photos never hit the 4.5MB function body limit. Returns null when Blob
+ * isn't configured (e.g. local dev), in which case files go with the form.
+ */
+async function uploadToBlob(files: { field: UploadedFile["field"]; file: File }[], onProgress: (pct: number) => void): Promise<UploadedFile[] | null> {
+  const probe = await fetch("/api/upload", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (probe.status === 501) return null;
+  const { upload } = await import("@vercel/blob/client");
+  const total = files.reduce((n, f) => n + f.file.size, 0) || 1;
+  const loaded = new Array(files.length).fill(0);
+
+  // The SDK retries failed requests for a long time; give up if nothing moves for 30s.
+  const controller = new AbortController();
+  let stall: ReturnType<typeof setTimeout> | undefined;
+  const armStall = () => {
+    clearTimeout(stall);
+    stall = setTimeout(() => controller.abort(), 30_000);
+  };
+  armStall();
+
+  try {
+    return await Promise.all(
+      files.map(async ({ field, file }, i) => {
+        const blob = await upload(`leads/${Date.now()}-${safeName(file.name)}`, file, {
+          access: "public",
+          handleUploadUrl: "/api/upload",
+          multipart: file.size > 8 * 1024 * 1024,
+          abortSignal: controller.signal,
+          onUploadProgress: (p) => {
+            armStall();
+            loaded[i] = p.loaded;
+            onProgress(Math.round((loaded.reduce((a, b) => a + b, 0) / total) * 100));
+          },
+        });
+        return { field, name: file.name, url: blob.url, size: file.size, type: file.type };
+      }),
+    );
+  } catch (err) {
+    controller.abort(); // stop sibling uploads
+    throw err;
+  } finally {
+    clearTimeout(stall);
+  }
+}
 
 function Field({ id, label, required, children, error }: { id: string; label: string; required?: boolean; children: React.ReactNode; error?: string }) {
   return (
@@ -32,7 +79,7 @@ function FileDrop({ name, label, multiple, accept }: { name: string; label: stri
   return (
     <label className="group flex cursor-pointer flex-col justify-between gap-6 border border-dashed border-line-strong p-5 transition-colors hover:border-blue focus-within:border-blue">
       <span className="label">{label}</span>
-      <span className="text-sm text-muted">{files.length ? files.join(", ") : `Drop or browse · max ${MAX_FILE_MB}MB${multiple ? " each" : ""}`}</span>
+      <span className="text-sm text-muted">{files.length ? files.join(", ") : `Drop or browse · max ${MAX_UPLOAD_MB}MB${multiple ? ` each, up to ${MAX_PHOTOS}` : ""}`}</span>
       <input
         type="file" name={name} multiple={multiple} accept={accept} className="sr-only"
         onChange={(e) => setFiles(Array.from(e.target.files ?? []).map((f) => f.name))}
@@ -46,6 +93,8 @@ export function Contact() {
   const [status, setStatus] = useState<Status>("idle");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [firstName, setFirstName] = useState("");
+  const [progress, setProgress] = useState(0);
+  const [errorMsg, setErrorMsg] = useState("");
   const pending = useRef<PrefillDetail | null>(null);
 
   const applyPrefill = (d: PrefillDetail) => {
@@ -86,8 +135,12 @@ export function Contact() {
     if (String(fd.get("phone") || "").replace(/\D/g, "").length < 10) e.phone = "Please enter a valid phone number.";
     if (!fd.get("signage")) e.signage = "Please choose an option.";
     if (!fd.get("consent")) e.consent = "Please confirm so we can contact you.";
-    for (const f of [...fd.getAll("logo"), ...fd.getAll("photos")]) {
-      if (f instanceof File && f.size > MAX_FILE_MB * 1024 * 1024) e.files = `Each file must be under ${MAX_FILE_MB}MB.`;
+    const photos = fd.getAll("photos").filter((f): f is File => f instanceof File && f.size > 0);
+    if (photos.length > MAX_PHOTOS) e.files = `Please upload up to ${MAX_PHOTOS} photos.`;
+    for (const f of [...fd.getAll("logo"), ...photos]) {
+      if (!(f instanceof File) || f.size === 0) continue;
+      if (f.size > MAX_UPLOAD_MB * 1024 * 1024) e.files = `Each file must be under ${MAX_UPLOAD_MB}MB.`;
+      else if (!ALLOWED_EXT.test(f.name)) e.files = `“${f.name}” isn't a supported file type.`;
     }
     return e;
   };
@@ -103,6 +156,28 @@ export function Contact() {
       return;
     }
     fd.append("attribution", JSON.stringify(getAttribution()));
+    setErrorMsg("");
+
+    const files = (["logo", "photos"] as const).flatMap((field) =>
+      fd.getAll(field).filter((f): f is File => f instanceof File && f.size > 0).map((file) => ({ field, file })),
+    );
+    if (files.length) {
+      setStatus("uploading");
+      setProgress(0);
+      try {
+        const uploaded = await uploadToBlob(files, setProgress);
+        if (uploaded) {
+          fd.delete("logo");
+          fd.delete("photos");
+          fd.append("uploads", JSON.stringify(uploaded));
+        }
+      } catch {
+        setErrorMsg(`Your files couldn't be uploaded. Try smaller files, or send the enquiry without them and email them to ${site.email}.`);
+        setStatus("error");
+        return;
+      }
+    }
+
     setStatus("sending");
     try {
       const res = await fetch("/api/lead", { method: "POST", body: fd });
@@ -187,10 +262,10 @@ export function Contact() {
                   {errors.consent && <p id="consent-err" className="mt-1.5 text-xs text-[#ff8a8a]">{errors.consent}</p>}
                 </div>
                 <div className="flex flex-col items-start gap-4 sm:col-span-2 sm:flex-row sm:items-center sm:justify-between">
-                  <button type="submit" className="btn btn-primary w-full sm:w-auto" disabled={status === "sending"}>
-                    {status === "sending" ? "Sending…" : <>Request my consultation <span className="arrow">→</span></>}
+                  <button type="submit" className="btn btn-primary w-full sm:w-auto" disabled={status === "sending" || status === "uploading"}>
+                    {status === "uploading" ? `Uploading files… ${progress}%` : status === "sending" ? "Sending…" : <>Request my consultation <span className="arrow">→</span></>}
                   </button>
-                  {status === "error" && <p role="alert" className="text-sm text-[#ff8a8a]">Something went wrong. Please call {site.phoneDisplay} or try again.</p>}
+                  {status === "error" && <p role="alert" className="text-sm text-[#ff8a8a]">{errorMsg || `Something went wrong. Please call ${site.phoneDisplay} or try again.`}</p>}
                 </div>
               </motion.form>
             )}

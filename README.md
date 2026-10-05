@@ -36,11 +36,13 @@ All copy and data live in `src/content/`, typed and shaped for a headless CMS.
 
 `/api/lead` sends every enquiry to **every integration you configure** in `.env.local`:
 
-- **Email** (Resend) with logo/photo attachments: `RESEND_API_KEY`, `LEAD_EMAIL_TO`
+- **Email** (Resend) with links to the uploaded logo/photos: `RESEND_API_KEY`, `LEAD_EMAIL_TO`
 - **CRM** via Zapier / Make / n8n webhook: `LEAD_WEBHOOK_URL`
 - **Google Sheets**: deploy `docs/google-sheets-apps-script.js`, set `GOOGLE_SHEETS_WEBHOOK_URL`
 - **HubSpot** Forms API: `HUBSPOT_PORTAL_ID`, `HUBSPOT_FORM_GUID`
 - **WhatsApp** Cloud API notification to the studio: `WHATSAPP_*`. Meta only allows free-form messages inside a 24-hour window, so for always-on alerts switch the payload to an approved template.
+
+**File uploads** go from the browser straight to **Vercel Blob** (`/api/upload` issues short-lived upload tokens), which avoids Vercel's 4.5MB request limit. Limits: 25MB per file, 1 logo + up to 10 photos, images/PDF/AI/EPS only. To enable, go to **Vercel → Storage → Create → Blob** and connect the store to this project; Vercel sets `BLOB_READ_WRITE_TOKEN` for you. Uploaded files get long random URLs, but anyone with a link can open the file, so only share leads internally. Without Blob (e.g. locally), files are sent with the form and attached to the email instead.
 
 Each lead includes UTM / `fbclid` / `gclid` attribution captured on landing. In production, if no integration delivers, the API returns an error rather than silently dropping the lead. The form has a honeypot and basic rate limiting.
 

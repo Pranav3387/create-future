@@ -1,15 +1,20 @@
 import { NextResponse } from "next/server";
+import { isBlobUrl, MAX_PHOTOS, type UploadedFile } from "@/lib/uploads";
 
 /**
  * Consultation lead handler.
  *
  * Fans each enquiry out to whichever integrations are configured via env vars
  * (see .env.example). Any number can be enabled at once:
- *   - Email (Resend) with logo/photo attachments
+ *   - Email (Resend) with links to uploaded logo/photos
  *   - Generic webhook: Zapier / Make / n8n → any CRM
  *   - Google Sheets (Apps Script web-app URL)
  *   - HubSpot Forms API
  *   - WhatsApp Cloud API notification to the studio
+ *
+ * Files are uploaded by the browser straight to Vercel Blob (/api/upload) and
+ * arrive here as URLs. Raw file parts are still accepted as a fallback when
+ * Blob isn't configured (local dev); those are attached to the email.
  */
 
 export const runtime = "nodejs";
@@ -20,7 +25,7 @@ const MAX_TOTAL = 25 * 1024 * 1024;
 type Lead = {
   name: string; company: string; email: string; phone: string; businessType: string; location: string;
   signage: string; budget: string; timeline: string; message: string; attribution: Record<string, string>;
-  submittedAt: string; files: { name: string; type: string; size: number }[];
+  submittedAt: string; files: { name: string; type: string; size: number; url?: string; field?: string }[];
 };
 
 const str = (fd: FormData, k: string, max = 2000) => String(fd.get(k) ?? "").trim().slice(0, max);
@@ -43,7 +48,11 @@ async function sendEmail(lead: Lead, files: File[]) {
   const attachments = await Promise.all(files.map(async (f) => ({ filename: f.name, content: Buffer.from(await f.arrayBuffer()).toString("base64") })));
   const rows = Object.entries({ Name: lead.name, Company: lead.company, Email: lead.email, Phone: lead.phone, "Business type": lead.businessType, Location: lead.location, Signage: lead.signage, Budget: lead.budget, Timeline: lead.timeline })
     .map(([k, v]) => `<tr><td style="padding:6px 16px 6px 0;color:#666">${k}</td><td style="padding:6px 0">${esc(v || "—")}</td></tr>`).join("");
-  const html = `<h2 style="font-family:sans-serif">New consultation request</h2><table style="font-family:sans-serif;font-size:14px">${rows}</table><p style="font-family:sans-serif;white-space:pre-wrap">${esc(lead.message)}</p><p style="font-family:monospace;font-size:12px;color:#888">${esc(JSON.stringify(lead.attribution))}</p>`;
+  const links = lead.files.filter((f) => f.url);
+  const fileList = links.length
+    ? `<h3 style="font-family:sans-serif">Uploaded files</h3><ul style="font-family:sans-serif;font-size:14px">${links.map((f) => `<li>${f.field === "logo" ? "Logo" : "Photo"}: <a href="${esc(f.url!)}">${esc(f.name)}</a> (${(f.size / 1048576).toFixed(1)}MB)</li>`).join("")}</ul>`
+    : "";
+  const html = `<h2 style="font-family:sans-serif">New consultation request</h2><table style="font-family:sans-serif;font-size:14px">${rows}</table><p style="font-family:sans-serif;white-space:pre-wrap">${esc(lead.message)}</p>${fileList}<p style="font-family:monospace;font-size:12px;color:#888">${esc(JSON.stringify(lead.attribution))}</p>`;
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -72,7 +81,8 @@ async function sendHubSpot(lead: Lead, pageUri: string) {
   const form = process.env.HUBSPOT_FORM_GUID;
   if (!portal || !form) return null;
   const [firstname, ...rest] = lead.name.split(" ");
-  const fields = { firstname, lastname: rest.join(" "), email: lead.email, phone: lead.phone, company: lead.company, message: `${lead.signage} · ${lead.budget} · ${lead.timeline}\n${lead.location}\n\n${lead.message}` };
+  const fileLinks = lead.files.filter((f) => f.url).map((f) => `${f.name}: ${f.url}`).join("\n");
+  const fields = { firstname, lastname: rest.join(" "), email: lead.email, phone: lead.phone, company: lead.company, message: `${lead.signage} · ${lead.budget} · ${lead.timeline}\n${lead.location}\n\n${lead.message}${fileLinks ? `\n\nFiles:\n${fileLinks}` : ""}` };
   const res = await fetch(`https://api.hsforms.com/submissions/v3/integration/submit/${portal}/${form}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -94,7 +104,7 @@ async function sendWhatsApp(lead: Lead) {
       messaging_product: "whatsapp",
       to,
       type: "text",
-      text: { body: `New SIGNOVA lead\n${lead.name}${lead.company ? ` · ${lead.company}` : ""}\n${lead.phone} · ${lead.email}\n${lead.signage} · ${lead.budget || "budget n/a"}\n${lead.location}` },
+      text: { body: `New SIGNOVA lead\n${lead.name}${lead.company ? ` · ${lead.company}` : ""}\n${lead.phone} · ${lead.email}\n${lead.signage} · ${lead.budget || "budget n/a"}\n${lead.location}${lead.files.length ? `\n${lead.files.length} file(s) uploaded` : ""}` },
     }),
   });
   if (!res.ok) throw new Error(`whatsapp ${res.status}`);
@@ -123,12 +133,23 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Files too large" }, { status: 413 });
   }
 
+  let uploads: UploadedFile[] = [];
+  try {
+    const parsed = JSON.parse(str(fd, "uploads", 20_000) || "[]") as UploadedFile[];
+    if (!Array.isArray(parsed) || parsed.length > MAX_PHOTOS + 1) throw new Error("bad uploads");
+    uploads = parsed
+      .filter((u) => u && typeof u.url === "string" && isBlobUrl(u.url))
+      .map((u) => ({ field: u.field === "logo" ? "logo" : "photos", name: String(u.name).slice(0, 200), url: u.url, size: Number(u.size) || 0, type: String(u.type).slice(0, 100) }));
+  } catch {
+    return NextResponse.json({ error: "Invalid uploads" }, { status: 400 });
+  }
+
   const lead: Lead = {
     name: str(fd, "name", 120), company: str(fd, "company", 160), email: str(fd, "email", 200), phone: str(fd, "phone", 40),
     businessType: str(fd, "businessType", 80), location: str(fd, "location", 120), signage: str(fd, "signage", 80),
     budget: str(fd, "budget", 40), timeline: str(fd, "timeline", 40), message: str(fd, "message", 5000),
     attribution, submittedAt: new Date().toISOString(),
-    files: files.map((f) => ({ name: f.name, type: f.type, size: f.size })),
+    files: [...uploads, ...files.map((f) => ({ name: f.name, type: f.type, size: f.size }))],
   };
 
   if (!lead.name || !/^\S+@\S+\.\S+$/.test(lead.email) || lead.phone.replace(/\D/g, "").length < 10 || !lead.signage || fd.get("consent") !== "yes") {
